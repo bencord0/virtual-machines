@@ -1,0 +1,8 @@
+latest.txt
+
+boot
+*.qcow2
+*.qcow2.asc
+
+vfs.sock
+vfs.sock.pid

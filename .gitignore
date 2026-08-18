@@ -1,0 +1,5 @@
+*.qcow
+*.qcow2
+*.raw
+*.img
+*.img.xz
