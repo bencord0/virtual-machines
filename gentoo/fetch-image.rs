@@ -1,13 +1,12 @@
 #!/usr/bin/env -S cargo +nightly -Zscript
 ---
 [package]
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 sequoia-openpgp = { version = "2", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto", "compression-deflate"] }
 eyre = "0.6"
-anyhow = "1"
 indicatif = "0.17"
 ---
 
@@ -22,6 +21,7 @@ use eyre::{bail, eyre, Result, WrapErr};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use sequoia_openpgp as openpgp;
+use openpgp::anyhow::anyhow as openpgp_err;
 use openpgp::cert::{Cert, CertParser};
 use openpgp::parse::stream::{
     DetachedVerifierBuilder, MessageLayer, MessageStructure, VerificationHelper, VerifierBuilder,
@@ -59,13 +59,13 @@ impl VerificationHelper for Helper {
                     .iter()
                     .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
                     .collect();
-                return Err(anyhow::anyhow!(
+                return Err(openpgp_err!(
                     "no valid signature from a trusted key: {}",
                     reasons.join("; ")
                 ));
             }
         }
-        Err(anyhow::anyhow!("message contained no signature"))
+        Err(openpgp_err!("message contained no signature"))
     }
 }
 
