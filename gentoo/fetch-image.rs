@@ -8,6 +8,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 sequoia-openpgp = { version = "2", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto", "compression-deflate"] }
 eyre = "0.6"
 anyhow = "1"
+indicatif = "0.17"
 ---
 
 //! Fetch the latest Gentoo autobuild qcow2 image, verifying it against the
@@ -18,6 +19,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use eyre::{bail, eyre, Result, WrapErr};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use sequoia_openpgp as openpgp;
 use openpgp::cert::{Cert, CertParser};
@@ -160,13 +162,33 @@ fn verify_detached(sig: &[u8], data_path: &str, certs: &[Cert]) -> Result<()> {
     let policy = &StandardPolicy::new();
     let helper = Helper { certs: certs.to_vec() };
     let data = File::open(data_path).wrap_err_with(|| format!("opening {data_path}"))?;
+    let len = data
+        .metadata()
+        .wrap_err_with(|| format!("stat {data_path}"))?
+        .len();
+    let pb = byte_bar(len, "verifying");
     DetachedVerifierBuilder::from_bytes(sig)
         .map_err(|e| eyre!("{e:#}"))?
         .with_policy(policy, None, helper)
         .map_err(|e| eyre!("{e:#}"))?
-        .verify_reader(data)
+        .verify_reader(pb.wrap_read(data))
         .map_err(|e| eyre!("{e:#}"))?;
+    pb.finish_and_clear();
     Ok(())
+}
+
+/// A byte-count progress bar (rate + ETA) rendered to stderr.
+fn byte_bar(len: u64, msg: &'static str) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{msg} {bytes}/{total_bytes} [{wide_bar}] {bytes_per_sec} eta {eta}",
+        )
+        .unwrap()
+        .progress_chars("=> "),
+    );
+    pb.set_message(msg);
+    pb
 }
 
 /// GET a URL into memory, erroring on non-success status.
@@ -200,7 +222,7 @@ fn download_resumable(url: &str, dest: &str) -> Result<()> {
     if have > 0 {
         req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
     }
-    let mut resp = req.send()?;
+    let resp = req.send()?;
 
     // 416 = the range is unsatisfiable, i.e. we already have the whole file.
     if have > 0 && resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -217,8 +239,22 @@ fn download_resumable(url: &str, dest: &str) -> Result<()> {
         .open(dest)
         .wrap_err_with(|| format!("opening {dest} for write"))?;
 
-    std::io::copy(&mut resp, &mut file).wrap_err_with(|| format!("streaming to {dest}"))?;
+    // Total = bytes already on disk + bytes this response will deliver (on a 206
+    // resume, content_length() is only the remaining range). Spinner if unknown.
+    let pb = match resp.content_length() {
+        Some(remaining) => byte_bar(have + remaining, "downloading"),
+        None => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_message("downloading");
+            pb
+        }
+    };
+    pb.set_position(have);
+
+    let mut src = pb.wrap_read(resp);
+    std::io::copy(&mut src, &mut file).wrap_err_with(|| format!("streaming to {dest}"))?;
     file.flush()?;
+    pb.finish_and_clear();
     Ok(())
 }
 
