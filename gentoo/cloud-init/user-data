@@ -5,7 +5,7 @@ chpasswd:
 
 write_files:
   - path: /etc/portage/repos.conf
-    content: W0RFRkFVTFRdCm1haW4tcmVwbyA9IGdlbnRvbwoKW2JlbmNvcmQwXQpsb2NhdGlvbiA9IC92YXIvZGIvcmVwb3MvYmVuY29yZDAKc3luYy11cmkgPSBodHRwczovL2dpdGh1Yi5jb20vYmVuY29yZDAvcG9ydGFnZS1vdmVybGF5CnN5bmMtdHlwZSA9IGdpdAo=
+    content: W0RFRkFVTFRdCm1haW4tcmVwbyA9IGdlbnRvbwoKW2JlbmNvcmQwXQpsb2NhdGlvbiA9IC92YXIvZGIvcmVwb3MvYmVuY29yZDAK
     encoding: b64
     owner: root:root
     permissions: '0644'
