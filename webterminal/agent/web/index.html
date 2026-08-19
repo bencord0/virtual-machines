@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Web Terminal</title>
+  <link rel="stylesheet" href="/xterm.css" />
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; }
+    #term { position: absolute; inset: 0; padding: 4px; }
+  </style>
+</head>
+<body>
+  <div id="term"></div>
+  <script src="/xterm.js"></script>
+  <script src="/addon-fit.js"></script>
+  <script>
+    const term = new Terminal({ cursorBlink: true, fontSize: 14 });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById('term'));
+    fit.fit();
+    term.write('connecting...\r\n');
+
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(proto + '://' + location.host + '/ws');
+    ws.binaryType = 'arraybuffer';
+    const enc = new TextEncoder();
+
+    // Control channel: JSON text frames (keystrokes go as binary frames).
+    function sendResize() {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      }
+    }
+
+    ws.onopen = () => { fit.fit(); sendResize(); term.write('\r\n'); };
+    ws.onclose = () => term.write('\r\n\r\n[connection closed]\r\n');
+    ws.onerror = () => term.write('\r\n\r\n[connection error]\r\n');
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        term.write(new Uint8Array(ev.data));
+      } else {
+        term.write(ev.data);
+      }
+    };
+
+    // Keystrokes -> binary frames (kept distinct from the JSON control channel).
+    term.onData((data) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(enc.encode(data));
+    });
+
+    // Re-fit and inform the PTY whenever the window changes size.
+    let pending;
+    window.addEventListener('resize', () => {
+      clearTimeout(pending);
+      pending = setTimeout(() => { fit.fit(); sendResize(); }, 100);
+    });
+
+    term.focus();
+  </script>
+</body>
+</html>

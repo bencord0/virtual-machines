@@ -1,0 +1,32 @@
+#cloud-config
+password: gentoo
+chpasswd:
+  expire: False
+
+mounts:
+  - [ agent, /opt/agent, virtiofs ]
+
+# Install the agent as a systemd unit. The binary lives on the virtiofs share;
+# RequiresMountsFor orders it after that mount, and Restart covers any boot race.
+write_files:
+  - path: /etc/systemd/system/agent.service
+    content: |
+      [Unit]
+      Description=Guest agent for web terminal access
+      Wants=network-online.target
+      After=network-online.target
+      RequiresMountsFor=/opt/agent
+
+      [Service]
+      ExecStart=/opt/agent/agent
+      Restart=on-failure
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+    owner: root:root
+    permissions: '0644'
+
+runcmd:
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, agent.service ]
