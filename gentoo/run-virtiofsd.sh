@@ -19,12 +19,16 @@ set -euo pipefail
 SOCKET="${SOCKET:-vfs.sock}"
 SHARED_DIR="${SHARED_DIR:-/var/db/repos}"
 
+function cleanup() {
+    rm -fv "${SOCKET}" "${SOCKET}.pid"
+}
+
 # Change to the script's directory so vfs.sock lands next to run-microvm.sh.
 cd "$(dirname "$0")"
+cleanup
 
-rm -fv "${SOCKET}" "${SOCKET}.pid"
-
-
-exec /usr/libexec/virtiofsd \
+trap cleanup EXIT
+sudo /usr/libexec/virtiofsd \
     --socket-path="$SOCKET" \
+    --socket-group="$USER" \
     --shared-dir="$SHARED_DIR"
