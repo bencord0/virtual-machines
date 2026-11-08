@@ -2,8 +2,5 @@ boot
 cloud-init/seed.iso
 
 serial.pty
-vfs.sock
-vfs.sock.pid
 
 share/agent
-target

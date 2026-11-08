@@ -1,6 +1,7 @@
 #!/bin/bash
 
-set -ex
+set -euo pipefail
+cd "$(dirname "${0}")"
 
 rm -fv seed.iso
 truncate --size 2M seed.iso
