@@ -10,35 +10,32 @@ the guest that serves a web terminal for clients to access the instance.
   - `GET /` &rarr; an xterm.js browser terminal ("webssh")
   - `GET /ws` &rarr; WebSocket bridged to a login shell in a PTY
 
+The boot/run tooling is shared with the other VMs: it lives in the `vm`
+crate at the repo root (`../src`) and is invoked through the thin wrapper scripts
+here. The per-VM differences are just CLI flags (see `run.sh`): the virtiofs
+share (`--shared-dir ./share:agent`) and the host&rarr;guest port forwards for
+the web (8080) and ssh (2222&rarr;22) ports.
+
 ## Usage
 
-1. **Extract the kernel + initramfs** (microvm boots them directly):
+1. **Fetch and snapshot.** This VM boots the same image as ../gentoo.
 
-       ./extract-boot.sh
+        ./fetch.sh
 
 2. **Compile the agent** into the virtiofs staging dir (`share/`):
 
        cargo +nightly -Z script -Z unstable-options build --release \
            --artifact-dir ./share --manifest-path ./agent/agent.rs
 
-3. **Build the cloud-init seed**: setup cloud-init:
+3. **Boot the VM.** `run.sh` supervises virtiofsd + qemu as one process tree
+   (the agent share is passed to qemu)
 
-       ( cd cloud-init && ./build.sh )
+       ./run.sh
 
-4. **Share the agent over virtiofs**:
-
-       ./run-virtiofsd.sh &
-
-    You can also use this directory to copy files out of the guest.
-
-5. **Boot the VM** (another shell):
-
-       ./run-microvm.sh
-
-6a. **Use the web console**:
+4a. **Use the web console**:
 
         xdg-open http://localhost:8080/
 
-6b. **Use the serial console**:
+4b. **Use the serial console**:
 
         minicom -D serial.pty

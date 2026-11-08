@@ -1,55 +1,58 @@
 # Gentoo - Cloud Init
 
+The tooling lives in the `vm` crate at the repo root;
+the wrapper scripts here just call the shared binaries with this VM's flags
+
 ## Usage
 
-1. ./fetch-image.rs
+### 1. ./fetch.sh
 
-Downloads and verifies the latest gentoo di-amd64-cloudinit virtual machine image.
+Downloads and verifies the latest gentoo di-amd64-cloudinit virtual machine
+image, snapshots the image and extracts the kernel and initramfs into `./boot`.
 
-Self-contained rust/cargo script. Currently requires a nightly toolchain,
-but that will settle down eventually. The script could have been bash, but this
-seemed like something fun to try.
+    $ ./fetch.sh
 
-Execute it directly:
+The boot extraction step uses libguestfs (`guestfish --ro`).
+We're using qemu microvms, which require direct booting from an external
+kernel, so the kernel and initramfs can be booted from the host filesystem.
 
-    $ ./fetch-image.rs
+### 2. ./run.sh
 
-Or compile it first and run as a separate step.
+Boots the microvm, supervising both child processes as a single tree:
 
-    $ cargo +nightly -Z script -Z unstable-options \
-        build --release --artifact-dir . --manifest-path fetch-image.rs
-    $ ./fetch-image
+  - **virtiofsd** shares mounts into the guest over virtio-fs.
+  - **qemu** runs the microvm itself.
 
-Read more about [cargo scripts](https://rust-lang.github.io/rfcs/3502-cargo-script.html).
+    $ ./run.sh
 
-2. ./extract-boot.sh
+`--shared-dir` takes `<dir>:<tag>[:ro]`, where `<tag>` is what the guest mounts.
+Print the qemu command without booting anything with `./run.sh --dry-run`.
 
-Uses libguestfs to peek into the downloaded disk image to extract the kernel and
-initramfs.
+The guest console is redirected to a pty symlinked as `serial.pty`; attach to it
+with:
 
-We're using qemu microvms, which require direct booting from an external kernel.
+    $ minicom -D serial.pty
 
-3. ./run-virtiofsd.sh
+Inside the guest, mount the shared portage tree (tag=repos):
 
-In a dedicated shell, and in a terminal that gives you sudo to root access.
+    $ mount -t virtiofs repos /var/db/repos
 
-    $ ./run-virtiofsd.sh
-
-Read more about [virtio-fs](https://virtio-fs.gitlab.io/).
-
-4. ./run-microvm.sh
-
-Runs qemu itself. Read the script to learn it's magick.
+Notable qemu options (`./run.sh --dry-run` prints the full invocation):
 
     - -M microvm - a firecracker inspired lighter VM
 
-    - -object memory-backend-file - required for virtio-fs
+    - -object memory-backend-file - required for virtio-fs.
+        Its size tracks --memory, so that has to fit in /dev/shm.
+
+        Avoid exactly 2G: on qemu 10.2.2 / linux 6.18 a microvm with
+        2GiB of guest RAM gets an e820 map that ends flush against the
+        MMIO hole, and the initramfs /init segfaults in ld.so. 1800M
+        and 4G both boot.
 
     - -nodefaults, -nographic, and -serial pty:serial.pty
+        qemu creates the serial.pty symlink on start and removes it on exit.
         Useful for running as a systemd service, and you still want
         to connect to the console interactively.
-
-        $ minicom -D serial.pty
 
     - -kernel and -initrd - microvm needs these to be external to the image
 
@@ -60,3 +63,4 @@ Runs qemu itself. Read the script to learn it's magick.
         We use this to access the host's portage tree.
 
 Read more about [qemu microvm](https://www.qemu.org/docs/master/system/i386/microvm.html)
+and [virtio-fs](https://virtio-fs.gitlab.io/).
