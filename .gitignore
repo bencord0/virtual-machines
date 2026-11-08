@@ -3,3 +3,10 @@
 *.raw
 *.img
 *.img.xz
+
+# Cachable, external dependencies.
+# Things from the internet, distributed on mirrors, checksummed.
+/distfiles
+
+# Rust build artifacts
+/target

@@ -1,38 +1,32 @@
 //! Boot a qemu microvm, with access to filesystems shared from the host:
 //!
-//!   * virtiofsd  -- shares a host directory into the guest (virtio-fs)
+//!   * virtiofsd  -- one per share, each handed its own listening socket
 //!   * qemu       -- the microvm hypervisor itself
 //!
-//! The guest mounts the shared filesystem with, e.g.:
+//! The guest mounts a share with:
 //!
 //!     mount -t virtiofs <tag> <mountpoint>
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::atomic::Ordering;
 
-use affinity::set_thread_affinity;
 use clap::Parser;
-use eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr, bail};
 
 use vm::{
-    QEMU_PID, ReapGuard, VIRTIOFSD_PID, abstract_connect, abstract_listener, install_signal_handlers,
-    spawn_with_fd,
+    FIRST_CHILD_FD, QEMU_PID, QemuConfig, ReapGuard, STAGING_FD, SharedDir, abstract_connect,
+    abstract_listener, dup_above, install_signal_handlers, share_fd, shell_quote, spawn_with_fds,
 };
-
-struct SharedDir {
-    dir: String,
-    tag: String,
-}
 
 /// Supervise virtiofsd + qemu to boot a microvm.
 #[derive(Parser, Debug)]
 #[command(about, long_about = None)]
 struct Args {
-    /// Host directories to share into the guest over virtio-fs.
-    /// Each entry requires a corresponding tag.
-    #[arg(long)]
+    /// Host directory to share into the guest over virtio-fs, as
+    /// <dir>:<tag>[:ro], where <tag> is what the guest mounts. Repeatable.
+    #[arg(long = "shared-dir", alias = "shared-dirs", value_name = "DIR:TAG[:ro]")]
     shared_dirs: Vec<SharedDir>,
 
     /// The virtiofsd binary (Gentoo installs it under libexec).
@@ -43,7 +37,7 @@ struct Args {
     #[arg(long, default_value = "./serial.pty")]
     serial: String,
 
-    /// Guest memory (also sizes the shared memory-backend-file).
+    /// Guest memory (also sizes the shared memory-backend-file, so it has to fit in /dev/shm).
     #[arg(long, default_value = "4G")]
     memory: String,
 
@@ -51,10 +45,9 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     smp: usize,
 
-    /// Pin tasks to specific CPUs.
+    /// Pin qemu to specific CPUs, e.g. `--taskset 0,1`.
     /// default: All CPUs are available.
-    /// example: [0] - pin to the first CPU only, [0,1] - limit to two specifc CPUs.
-    #[arg(long)]
+    #[arg(long, value_delimiter = ',')]
     taskset: Option<Vec<usize>>,
 
     /// Host<->guest port forward, e.g. `tcp::8080-:8080`. Repeatable.
@@ -73,6 +66,10 @@ struct Args {
     #[arg(long, default_value = "./boot/initramfs.img")]
     initrd: String,
 
+    /// Kernel command line.
+    #[arg(long, default_value = "earlyprintk=ttyS0 console=ttyS0 root=/dev/vda2")]
+    append: String,
+
     /// cloud-init seed image.
     #[arg(long, default_value = "./cloud-init/seed.iso")]
     seed: String,
@@ -80,165 +77,136 @@ struct Args {
     /// cloud-init seed image build script.
     #[arg(long, default_value = "./cloud-init/build.sh")]
     seed_build_script: String,
+
+    /// Print the qemu command that would run, then exit.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl Args {
+    fn qemu_config(&self) -> QemuConfig {
+        QemuConfig {
+            shared_dirs: self.shared_dirs.clone(),
+            serial: self.serial.clone(),
+            memory: self.memory.clone(),
+            smp: self.smp,
+            hostfwd: self.hostfwd.clone(),
+            image: self.image.clone(),
+            kernel: self.kernel.clone(),
+            initrd: self.initrd.clone(),
+            append: self.append.clone(),
+            seed: self.seed.clone(),
+        }
+    }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let config = args.qemu_config();
 
-    // qemu recreates the pty symlink on start; a stale one would make it fail.
+    if args.dry_run {
+        println!("{}", shell_quote(&config.argv()));
+        return Ok(());
+    }
+
+    // qemu symlinks the guest pty here on start and hard-fails on a stale one
+    // ("Failed to create PTY symlink: File exists"); it removes its own on exit.
     let _ = std::fs::remove_file(&args.serial);
 
-    // Cloud-Init Seed
-    let mut cmd = Command::new(&args.seed_build_script);
-    let status = cmd.status()?;
-    match status.code() {
-        Some(0) | None => {},
-        Some(code) => std::process::exit(code),
-    }
+    build_seed(&args.seed_build_script)?;
 
     // Terminating the supervisor should tear the whole VM down with it.
     install_signal_handlers().wrap_err("installing signal handlers")?;
 
-    // 1. Listening socket in the abstract namespace (no filesystem entry).
-    let name = format!("vfs-{}", std::process::id());
-    let (listen_fd, addr, addr_len) =
-        abstract_listener(name.as_bytes()).wrap_err("creating vhost-user listener")?;
+    // One listener per share. virtiofsd's --fd takes a listening (not yet
+    // connected) socket, and every `-chardev socket,fd=` is a separate
+    // connection, so a shared listener would leave all but one share unpaired.
+    let mut children = Vec::new();
+    let mut staged = Vec::new();
+    for (i, share) in config.shared_dirs.iter().enumerate() {
+        let name = format!("vfs-{}-{i}", std::process::id());
+        let (listener, addr, addr_len) = abstract_listener(name.as_bytes())
+            .wrap_err_with(|| format!("creating vhost-user listener @{name}"))?;
 
-    // We use FD 3 for the primary socket connection to QEMU.
-    let primary_socket_fd = 3;
+        let mut cmd = Command::new(&args.virtiofsd);
+        cmd.arg(format!("--fd={FIRST_CHILD_FD}"))
+            .arg(format!("--shared-dir={}", share.dir));
+        if share.readonly {
+            cmd.arg("--readonly");
+        }
+        children.push(ReapGuard(
+            spawn_with_fds(&mut cmd, &[(listener.as_raw_fd(), FIRST_CHILD_FD)])
+                .wrap_err_with(|| format!("spawning virtiofsd for {}", share.dir))?,
+        ));
 
-    // List of FDs that will be passed to QEMU via -chardev/fd=X
-    let mut child_fds = vec![primary_socket_fd];
-    let mut share_configs = Vec::new();
-    let mut fd_counter = 3;
+        let conn = abstract_connect(&addr, addr_len)
+            .wrap_err_with(|| format!("connecting to virtiofsd for {}", share.dir))?;
+        drop(listener);
 
-    // 2 & 3. Spawn virtiofsd for every shared directory
-    for (i, shared) in args.shared_dirs.iter().enumerate() {
-        let fd = fd_counter;
-        child_fds.push(fd);
-
-        let virtiofsd_child = ReapGuard(
-            spawn_with_fd(
-                Command::new(&args.virtiofsd).args([
-                    format!("--fd={fd}"),
-                    format!("--shared-dir={}", shared.dir),
-                ]),
-                listen_fd.as_raw_fd(), // Passing the main listener FD to the first one (simplification/assumption)
-                fd,
-            )
-            .wrap_err_with(|| format!("spawning virtiofsd for {}", shared.dir))?,
-        );
-
-        share_configs.push((fd, shared.tag.clone()));
-        fd_counter += 1;
+        // Park qemu's end above every destination: the parent's own sockets land
+        // on 3, 4, 5..., which are exactly the numbers qemu wants them on.
+        staged.push(dup_above(conn.as_fd(), STAGING_FD).wrap_err("staging qemu's socket")?);
     }
 
-    // 3. Connect QEMU socket to the first virtiofsd (This remains the primary connection)
-    // In a real scenario, we'd need a more complex connection strategy for multiple independent services.
-    // For this implementation, we assume the first fd is the connection point for QEMU.
-    let conn_fd = abstract_connect(&addr, addr_len).wrap_err("connecting to vhost-user listener")?;
+    let pairs: Vec<(RawFd, RawFd)> = staged
+        .iter()
+        .enumerate()
+        .map(|(i, fd)| (fd.as_raw_fd(), share_fd(i)))
+        .collect();
 
-    // 4. Launch QEMU, passing ALL necessary file descriptors
-    let qemu_cmd_args = qemu_command(&args, &child_fds, &share_configs);
-
-    // 4. Launch QEMU, passing ALL necessary file descriptors
-    let mut qemu_child = spawn_with_fd(
-        &mut Command::new("qemu-system-x86_64"), // Simplified for this scope
-        conn_fd.as_raw_fd(), // Primary connection FD
-        primary_socket_fd,
-    )
-    .wrap_err("spawning qemu-system-x86_64")?;
-
+    let mut cmd = config.command();
+    if let Some(cpus) = &args.taskset {
+        pin_to_cpus(&mut cmd, cpus)?;
+    }
+    let mut qemu_child =
+        spawn_with_fds(&mut cmd, &pairs).wrap_err("spawning qemu-system-x86_64")?;
     QEMU_PID.store(qemu_child.id() as i32, Ordering::SeqCst);
+    drop(staged);
 
-    // Drop primary FDs used by the supervisor
-    drop(listen_fd);
-    drop(conn_fd);
-
-    // Drop the primary FD used in the spawn call, but keep children alive
-    let primary_fd_to_drop = child_fds[0];
-
-    // 5. Wait for qemu (the workload), then stop all virtiofsds.
+    // Wait for qemu (the workload); dropping the guards stops every virtiofsd.
     let status = qemu_child.wait().wrap_err("waiting for qemu")?;
-
-    // Stop all background services
-    for child in children {
-        drop(child);
-    }
+    drop(children);
 
     match status.code() {
+        // None: qemu took the SIGTERM we forwarded, i.e. we asked it to stop.
         Some(0) | None => Ok(()),
         Some(code) => std::process::exit(code),
     }
 }
 
-fn qemu_command(args: &Args, all_fds: &[usize], share_configs: &[(usize, String)]) -> Command {
-    // Networking: `user` NAT, plus one hostfwd= clause per --hostfwd flag.
-    let mut netdev = String::from("user,id=qemu0");
-    for fwd in &args.hostfwd {
-        netdev.push_str(",hostfwd=");
-        netdev.push_str(fwd);
+/// Build the cloud-init seed image. A signalled build leaves a stale seed.iso
+/// in place, so unlike qemu's exit it is an error rather than a clean stop.
+fn build_seed(script: &str) -> Result<()> {
+    let status = Command::new(script)
+        .status()
+        .wrap_err_with(|| format!("running {script}"))?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => bail!("{script} exited with {code}"),
+        None => bail!("{script} was killed by a signal ({status})"),
     }
+}
 
-    let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.args([
-        // Machine Type - As native as possible
-        "-M", "microvm",
-        "--enable-kvm", "-cpu", "host",
-
-        // Machine size
-        "-smp", &args.smp.to_string(), "-m", &args.memory,
-        "-object", &format!("memory-backend-file,id=mem0,size={},mem-path=/dev/shm,share=on", args.memory),
-        "-numa", "node,memdev=mem0",
-
-        // Open a TTY that clients can detach from
-        "-nodefault", "-no-user-config", "-nographic",
-        "-serial", &format!("pty:{}" , args.serial),
-
-        // Kernel / initrd (extracted by fetch-image into ./boot)
-        "-kernel", &args.kernel,
-        "-append", "earlyprintk=ttyS0 console=ttyS0 root=/dev/vda2",
-        "-initrd", &args.initrd,
-
-        // Rootfs
-        "-device", "virtio-blk-device,drive=img0",
-        "-drive", &format!("file={},if=none,format=qcow2,id=img0,snapshot=on", args.image),
-
-        // Cloud-init drive
-        "-device", "virtio-blk-device,drive=img1",
-        "-drive", &format!("file={},if=none,format=raw,id=img1,readonly=on", args.seed),
-
-        // virtio-fs setup: one -chardev socket for each share
-        // and one -device vhost-user-fs-device for each share, referencing its unique FD.
-        // Note: This assumes the primary socket FD (passed to QEMU) handles the primary connection.
-        // For simplicity here, we pass all FDs to the socket argument, which QEMU should handle sequentially.
-        // A more robust solution would pass one FD per share.
-        "-chardev", "socket,id=vfs0,fd={}", all_fds[0],
-    ]);
-
-    // Add all subsequent shares as separate -chardev arguments (this is a heuristic based on QEMU flags)
-    for (i, (fd, tag)) in share_configs.iter().enumerate().skip(1) {
-        cmd = cmd.arg("-chardev").arg("socket,id=vfs{}-{}", i, tag).arg("fd={}", fd);
-    }
-
-    // Add all devices referencing the shares
-    for (i, (_, tag)) in share_configs.iter().enumerate() {
-        cmd = cmd.arg("-device").arg(format!("vhost-user-fs-device,queue-size=1024,chardev=vfs{}-{}", i, tag));
-    }
-
-    // Networking
-    cmd = cmd.arg("-device").arg("virtio-net-device,netdev=qemu0");
-    cmd = cmd.arg("-netdev").arg(&netdev);
-
-
-    if let Some(taskset) = args.taskset.clone() {
-        unsafe {
-            cmd.pre_exec(move || {
-                let _ = set_thread_affinity(&taskset);
-                Ok(())
-            });
+/// Restrict `cmd` to `cpus`. The set is built here rather than in `pre_exec`,
+/// which runs post-fork and so must not allocate.
+fn pin_to_cpus(cmd: &mut Command, cpus: &[usize]) -> Result<()> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_ZERO(&mut set) };
+    for &cpu in cpus {
+        if cpu >= libc::CPU_SETSIZE as usize {
+            bail!("cpu {cpu} is outside CPU_SETSIZE ({})", libc::CPU_SETSIZE);
         }
+        unsafe { libc::CPU_SET(cpu, &mut set) };
     }
 
-    cmd
+    unsafe {
+        cmd.pre_exec(move || {
+            // pid 0 = the calling thread, which becomes qemu; children inherit it.
+            if libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
 }

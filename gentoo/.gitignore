@@ -1,8 +1,6 @@
 latest.txt
 
 boot
+serial.pty
 *.qcow2
 *.qcow2.asc
-
-vfs.sock
-vfs.sock.pid

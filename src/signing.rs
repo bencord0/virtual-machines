@@ -2,7 +2,7 @@ use sequoia_openpgp as openpgp;
 use openpgp::{
     KeyHandle,
     anyhow::anyhow as openpgp_err,
-    cert::{Cert, CertParser},
+    cert::Cert,
     parse::stream::{
         MessageLayer,
         MessageStructure,

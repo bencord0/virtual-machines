@@ -4,11 +4,19 @@ chpasswd:
   expire: False
 
 write_files:
-  - path: /etc/portage/repos.conf
-    content: W0RFRkFVTFRdCm1haW4tcmVwbyA9IGdlbnRvbwoKW2JlbmNvcmQwXQpsb2NhdGlvbiA9IC92YXIvZGIvcmVwb3MvYmVuY29yZDAK
-    encoding: b64
+  - path: /etc/portage/make.conf
     owner: root:root
     permissions: '0644'
+    content: |
+      LC_MESSAGES=C.UTF-8
+  - path: /etc/portage/repos.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [DEFAULT]
+      main-repo = gentoo
+      [bencord0]
+      location = /var/db/repos/bencord0
 
 mounts:
   - [ repos, /var/db/repos, virtiofs ]

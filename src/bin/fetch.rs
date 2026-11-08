@@ -168,12 +168,11 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
 fn parse_image_line(body: &str) -> Result<(String, u64)> {
     for line in body.lines() {
         let mut fields = line.split_whitespace();
-        if let (Some(path), Some(size), None) = (fields.next(), fields.next(), fields.next()) {
-            if path.ends_with(".qcow2") {
-                if let Ok(size) = size.parse::<u64>() {
-                    return Ok((path.to_owned(), size));
-                }
-            }
+        if let (Some(path), Some(size), None) = (fields.next(), fields.next(), fields.next())
+            && path.ends_with(".qcow2")
+            && let Ok(size) = size.parse::<u64>()
+        {
+            return Ok((path.to_owned(), size));
         }
     }
     Err(eyre!("could not find a '<path>.qcow2 <size>' line"))
