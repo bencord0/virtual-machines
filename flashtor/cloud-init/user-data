@@ -1,0 +1,26 @@
+#cloud-config
+password: gentoo
+chpasswd:
+  expire: False
+
+write_files:
+  - path: /etc/portage/make.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      LC_MESSAGES=C.UTF-8
+  - path: /etc/portage/repos.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [DEFAULT]
+      main-repo = gentoo
+      [bencord0]
+      location = /var/db/repos/bencord0
+
+mounts:
+  - [ repos, /var/db/repos, virtiofs ]
+
+runcmd:
+  - ["eselect", "profile", "set", "bencord0:host/flashtor2"]
+  - ["emerge", "--update", "--quiet", "--newuse", "@world"]
