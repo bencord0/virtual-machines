@@ -1,0 +1,49 @@
+#cloud-config
+password: gentoo
+chpasswd:
+  expire: False
+
+write_files:
+  # Portage
+  - path: /etc/portage/make.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      LC_MESSAGES=C.UTF-8
+  - path: /etc/portage/repos.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [DEFAULT]
+      main-repo = gentoo
+      [bencord0]
+      location = /var/db/repos/bencord0
+      [guru]
+      location = /var/db/repos/guru
+
+  # Code Server
+  - path: /etc/systemd/user-preset/10-code-server.preset
+    owner: root:root
+    permissions: '0644'
+    content: |
+      enable code-server-bin.service
+  - path: /home/gentoo/.config/code-server/config.yaml
+    owner: gentoo:users
+    permissions: '0644'
+    defer: true
+    content: |
+      bind-addr: 0.0.0.0:8080
+      auth: none
+      cert: false
+
+mounts:
+  - [ repos, /var/db/repos, virtiofs ]
+
+# Don't use packages top-level key, as this unnecessarily calls `emerge --sync`
+runcmd:
+  - ["getuto"] # Update gentoo certificate db
+  - ["eselect", "profile", "set", "bencord0:host/codeserver"]
+  - ["emerge", "--update", "--quiet", "--newuse", "@world"]
+  - ["systemctl", "--machine=gentoo@", "preset-all", "--user"]
+  - ["systemctl", "--machine=gentoo@", "start", "--user", "default.target"]
+
